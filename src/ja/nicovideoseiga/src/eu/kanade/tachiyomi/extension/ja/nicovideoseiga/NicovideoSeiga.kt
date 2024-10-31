@@ -114,8 +114,12 @@ class NicovideoSeiga : HttpSource() {
             .filter { it.ownership.sellStatus != "publication_finished" }
             .map { chapter ->
                 SChapter.create().apply {
-                    val isPaid = chapter.ownership.sellStatus == "selling"
-                    name = (if (isPaid) "\uD83D\uDCB4 " else "") + chapter.meta.title
+                    val prefix = when (chapter.ownership.sellStatus) {
+                        "selling" -> "\uD83D\uDCB4 "
+                        "pre_selling" -> "\u23F3\uD83D\uDCB4 "
+                        else -> ""
+                    }
+                    name = prefix + chapter.meta.title
                     // Timestamp is in seconds, convert to milliseconds
                     date_upload = chapter.meta.createdAt * 1000
                     // While chapters are properly sorted, authors often add promotional material as "chapters" which breaks trackers
@@ -216,7 +220,7 @@ class NicovideoSeiga : HttpSource() {
         // drm.cdn.nicomanga.jp -> Paid manga (Encrypted)
         // deliver.cdn.nicomanga.jp -> Free manga (Unencrypted)
         val imageRegex =
-            Regex("https://drm.cdn.nicomanga.jp/image/([a-f0-9]+)_\\d{4}/\\d+p(\\.[a-z]+)?(\\?\\d+)?")
+            Regex("https://drm.cdn.nicomanga.jp/image/([a-f0-9]+)_\\d+/\\d+p(\\.[a-z]+)?(\\?\\d+)?")
         val match = imageRegex.find(chain.request().url.toUrl().toString())
             ?: return chain.proceed(chain.request())
 
