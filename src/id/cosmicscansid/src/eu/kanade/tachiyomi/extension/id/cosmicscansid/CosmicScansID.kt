@@ -1,63 +1,117 @@
 package eu.kanade.tachiyomi.extension.id.cosmicscansid
 
+import android.content.SharedPreferences
+import android.widget.Toast
+import androidx.preference.EditTextPreference
+import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
+import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
+import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
+import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.multisrc.mangathemesia.MangaThemesia
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
-import eu.kanade.tachiyomi.source.model.Filter
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
+import keiyoushi.utils.getPreferences
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.select.Elements
 import java.util.concurrent.TimeUnit
 
-class CosmicScansID : MangaThemesia("CosmicScans.id", "https://cosmic1.co", "id", "/semua-komik") {
+class CosmicScansID :
+    MangaThemesia(
+        "CosmicScans.id",
+        "https://lc3.cosmicscans.asia",
+        "id",
+    ),
+    ConfigurableSource {
+
+    private val defaultBaseUrl: String = super.baseUrl
+
+    private val preferences = getPreferences {
+        getString(DEFAULT_BASE_URL_PREF, defaultBaseUrl).let { domain ->
+            if (domain != defaultBaseUrl) {
+                edit()
+                    .putString(BASE_URL_PREF, defaultBaseUrl)
+                    .putString(DEFAULT_BASE_URL_PREF, defaultBaseUrl)
+                    .apply()
+            }
+        }
+    }
+
+    private val isCi = System.getenv("CI") == "true"
+
+    override val baseUrl: String get() = when {
+        isCi -> defaultBaseUrl
+        else -> preferences.prefBaseUrl
+    }
 
     override val client: OkHttpClient = super.client.newBuilder()
+        .setRandomUserAgent(
+            preferences.getPrefUAType(),
+            preferences.getPrefCustomUA(),
+        )
         .rateLimit(20, 4, TimeUnit.SECONDS)
         .build()
 
     override val hasProjectPage = true
-    override val projectPageString = "/semua-komik"
 
-    override fun latestUpdatesRequest(page: Int) = GET(baseUrl + if (page > 1) "/page/$page" else "", headers)
+    private var _cachedBaseUrl: String? = null
+    private var SharedPreferences.prefBaseUrl: String
+        get() {
+            if (_cachedBaseUrl == null) {
+                _cachedBaseUrl = getString(BASE_URL_PREF, defaultBaseUrl)!!
+            }
+            return _cachedBaseUrl!!
+        }
+        set(value) {
+            _cachedBaseUrl = value
+            edit().putString(BASE_URL_PREF, value).apply()
+        }
 
     // search
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        if (query.isBlank()) {
+            return super.searchMangaRequest(page, query, filters)
+        }
+
         val url = baseUrl.toHttpUrl().newBuilder()
             .addPathSegments("page/$page/")
             .addQueryParameter("s", query)
 
-        filters.forEach { filter ->
-            when (filter) {
-                // if site has project page, default value "hasProjectPage" = false
-                is ProjectFilter -> {
-                    if (filter.selectedValue() == "project-filter-on") {
-                        url.setPathSegment(0, projectPageString.substring(1))
-                    }
-                }
-                else -> { /* Do Nothing */ }
-            }
-        }
         return GET(url.build())
     }
 
     override fun searchMangaSelector() = ".bixbox:not(.hothome):has(.hpage) .utao .uta .imgu, .bixbox:not(.hothome) .listupd .bs .bsx"
-
-    override fun getFilterList(): FilterList {
-        val filters = mutableListOf<Filter<*>>(
-            Filter.Separator(),
-            Filter.Header("$name Project List page"),
-            ProjectFilter(intl["project_filter_title"], projectFilterOptions),
-            OrderByFilter(intl["order_by_filter_title"], orderByFilterOptions),
-        )
-        return FilterList(filters)
-    }
 
     // manga details
     override val seriesDescriptionSelector = ".entry-content[itemprop=description] :not(a,p:has(a))"
     override fun Elements.imgAttr(): String = this.first()?.imgAttr() ?: ""
 
     // pages
-    override val pageSelector = "div#readerarea img:not(noscript img)"
+    override val pageSelector = "div#readerarea img:not(noscript img):not([alt=''])"
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        addRandomUAPreferenceToScreen(screen)
+
+        EditTextPreference(screen.context).apply {
+            key = BASE_URL_PREF
+            title = "Edit source URL"
+            summary = "For temporary use, if the extension is updated the change will be lost."
+            dialogTitle = title
+            dialogMessage = "Default URL:\n$defaultBaseUrl"
+            setDefaultValue(defaultBaseUrl)
+            setOnPreferenceChangeListener { _, _ ->
+                Toast.makeText(screen.context, "Restart the application to apply the changes", Toast.LENGTH_LONG).show()
+                true
+            }
+        }.also { screen.addPreference(it) }
+    }
+
+    companion object {
+        private const val BASE_URL_PREF = "overrideBaseUrl"
+        private const val DEFAULT_BASE_URL_PREF = "defaultBaseUrl"
+    }
 }

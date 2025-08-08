@@ -138,6 +138,21 @@ object MDConstants {
         return "${altTitlesInDescPref}_$dexLang"
     }
 
+    private const val preferExtensionLangTitlePref = "preferExtensionLangTitle"
+    fun getPreferExtensionLangTitlePrefKey(dexLang: String): String {
+        return "${preferExtensionLangTitlePref}_$dexLang"
+    }
+
+    private const val finalChapterInDescPref = "finalChapterInDesc"
+    fun getFinalChapterInDescPrefKey(dexLang: String): String {
+        return "${finalChapterInDescPref}_$dexLang"
+    }
+
+    private const val includeUnavailablePref = "includeUnavailable"
+    fun getIncludeUnavailablePrefKey(dexLang: String): String {
+        return "${includeUnavailablePref}_$dexLang"
+    }
+
     private const val tagGroupContent = "content"
     private const val tagGroupFormat = "format"
     private const val tagGroupGenre = "genre"

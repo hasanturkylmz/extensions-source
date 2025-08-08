@@ -1,8 +1,9 @@
 ext {
     extName = 'Manga Livre'
     extClass = '.MangaLivre'
-    extVersionCode = 1
-    isNsfw = true
+    themePkg = 'madara'
+    baseUrl = 'https://mangalivre.tv'
+    overrideVersionCode = 1
 }
 
 apply from: "$rootDir/common.gradle"

@@ -20,7 +20,7 @@ import java.util.Locale
 
 class BacaKomik : ParsedHttpSource() {
     override val name = "BacaKomik"
-    override val baseUrl = "https://bacakomik.net"
+    override val baseUrl = "https://bacakomik.my"
     override val lang = "id"
     override val supportsLatest = true
     private val dateFormat: SimpleDateFormat = SimpleDateFormat("MMM d, yyyy", Locale.US)
@@ -34,12 +34,14 @@ class BacaKomik : ParsedHttpSource() {
         .rateLimit(12, 3)
         .build()
 
+    private fun pagePath(page: Int) = if (page > 1) "page/$page/" else ""
+
     override fun popularMangaRequest(page: Int): Request {
-        return GET("$baseUrl/daftar-komik/page/$page/?order=popular", headers)
+        return GET("$baseUrl/daftar-komik/${pagePath(page)}?order=popular", headers)
     }
 
     override fun latestUpdatesRequest(page: Int): Request {
-        return GET("$baseUrl/daftar-komik/page/$page/?order=update", headers)
+        return GET("$baseUrl/daftar-komik/${pagePath(page)}?order=update", headers)
     }
 
     override fun popularMangaSelector() = "div.animepost"
@@ -66,7 +68,6 @@ class BacaKomik : ParsedHttpSource() {
         val builtUrl = if (page == 1) "$baseUrl/daftar-komik/" else "$baseUrl/daftar-komik/page/$page/?order="
         val url = builtUrl.toHttpUrl().newBuilder()
         url.addQueryParameter("title", query)
-        url.addQueryParameter("page", page.toString())
         filters.forEach { filter ->
             when (filter) {
                 is AuthorFilter -> {
@@ -140,25 +141,25 @@ class BacaKomik : ParsedHttpSource() {
             val value = date.split(' ')[0].toInt()
             when {
                 "detik" in date -> Calendar.getInstance().apply {
-                    add(Calendar.SECOND, value * -1)
+                    add(Calendar.SECOND, -value)
                 }.timeInMillis
                 "menit" in date -> Calendar.getInstance().apply {
-                    add(Calendar.MINUTE, value * -1)
+                    add(Calendar.MINUTE, -value)
                 }.timeInMillis
                 "jam" in date -> Calendar.getInstance().apply {
-                    add(Calendar.HOUR_OF_DAY, value * -1)
+                    add(Calendar.HOUR_OF_DAY, -value)
                 }.timeInMillis
                 "hari" in date -> Calendar.getInstance().apply {
-                    add(Calendar.DATE, value * -1)
+                    add(Calendar.DATE, -value)
                 }.timeInMillis
                 "minggu" in date -> Calendar.getInstance().apply {
-                    add(Calendar.DATE, value * 7 * -1)
+                    add(Calendar.DATE, -value * 7)
                 }.timeInMillis
                 "bulan" in date -> Calendar.getInstance().apply {
-                    add(Calendar.MONTH, value * -1)
+                    add(Calendar.MONTH, -value)
                 }.timeInMillis
                 "tahun" in date -> Calendar.getInstance().apply {
-                    add(Calendar.YEAR, value * -1)
+                    add(Calendar.YEAR, -value)
                 }.timeInMillis
                 else -> {
                     0L

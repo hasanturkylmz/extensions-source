@@ -1,14 +1,12 @@
 package eu.kanade.tachiyomi.extension.fr.animesama
 
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -28,7 +26,7 @@ class AnimeSama : ParsedHttpSource() {
 
     override val lang = "fr"
 
-    override val supportsLatest = false
+    override val supportsLatest = true
 
     override val client: OkHttpClient = network.cloudflareClient
 
@@ -37,10 +35,15 @@ class AnimeSama : ParsedHttpSource() {
 
     // Popular
     override fun popularMangaRequest(page: Int): Request {
-        return GET("$baseUrl/catalogue/", headers)
+        val url = "$baseUrl/catalogue".toHttpUrl().newBuilder()
+            .addQueryParameter("type[0]", "Scans")
+            .addQueryParameter("page", page.toString())
+            .build()
+
+        return GET(url, headers)
     }
 
-    override fun popularMangaSelector() = ".cardListAnime.Scans"
+    override fun popularMangaSelector() = "#list_catalog > div"
 
     override fun popularMangaFromElement(element: Element): SManga {
         return SManga.create().apply {
@@ -50,41 +53,44 @@ class AnimeSama : ParsedHttpSource() {
         }
     }
 
-    override fun popularMangaNextPageSelector(): String? = null
+    override fun popularMangaNextPageSelector(): String = "#list_pagination > a.bg-sky-900 + a"
 
     // Latest
-    override fun latestUpdatesRequest(page: Int) = throw UnsupportedOperationException()
-
-    override fun latestUpdatesSelector() = throw UnsupportedOperationException()
-
-    override fun latestUpdatesFromElement(element: Element) = throw UnsupportedOperationException()
-
-    override fun latestUpdatesNextPageSelector() = throw UnsupportedOperationException()
-
-    // Search
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/catalogue/searchbar.php"
-        val formBody = FormBody.Builder()
-            .add("query", query)
-            .build()
-
-        return POST(url, headers, formBody)
+    override fun latestUpdatesRequest(page: Int): Request {
+        return GET(baseUrl, headers)
     }
 
-    override fun searchMangaSelector() = ".cardListAnime.Scans"
-    override fun searchMangaNextPageSelector(): String? = null
-    override fun searchMangaFromElement(element: Element): SManga {
+    override fun latestUpdatesSelector() = "#containerAjoutsScans > div"
+
+    override fun latestUpdatesFromElement(element: Element): SManga {
         return SManga.create().apply {
             title = element.select("h1").text()
-            setUrlWithoutDomain(element.select("a").attr("href"))
+            setUrlWithoutDomain(element.select("a").attr("href").removeSuffix("scan/vf/"))
             thumbnail_url = element.select("img").attr("src")
         }
     }
 
+    override fun latestUpdatesNextPageSelector() = "#list_pagination > a.bg-sky-900 + a"
+
+    // Search
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val url = "$baseUrl/catalogue".toHttpUrl().newBuilder()
+            .addQueryParameter("type[0]", "Scans")
+            .addQueryParameter("search", query)
+            .addQueryParameter("page", page.toString())
+            .build()
+
+        return GET(url, headers)
+    }
+
+    override fun searchMangaSelector() = popularMangaSelector()
+    override fun searchMangaNextPageSelector(): String = popularMangaNextPageSelector()
+    override fun searchMangaFromElement(element: Element): SManga = popularMangaFromElement(element)
+
     // Details
     override fun mangaDetailsParse(document: Document): SManga = SManga.create().apply {
-        description = document.select("#sousBlocMilieu > div h2:contains(Synopsis)+p").text()
-        genre = document.select("#sousBlocMilieu > div h2:contains(Genres)+a").text()
+        description = document.select("#sousBlocMiddle > div h2:contains(Synopsis)+p").text()
+        genre = document.select("#sousBlocMiddle > div h2:contains(Genres)+a").text()
         title = document.select("#titreOeuvre").text()
         thumbnail_url = document.select("#coverOeuvre").attr("src")
     }
@@ -116,12 +122,10 @@ class AnimeSama : ParsedHttpSource() {
         val javascriptFileContent = javascriptFile.body.string()
 
         val parsedJavascriptFileToJson = javascriptFileContent
-            .split(" ", ",")
-            .filter { it.contains("eps") && !it.contains("drive.google.com") }
-            .mapNotNull { it.replace("=", "").replace("eps", "").toIntOrNull() }
-            .sorted()
-            .asReversed()
-            .toSet() // Remove duplicate episodes
+            .let { Regex("""eps(\d+)""").findAll(it) }
+            .map { it.groupValues[1].toInt() }
+            .distinct() // Remove duplicate episodes
+            .sortedDescending().toList()
         val parsedChapterList: MutableList<SChapter> = ArrayList()
         var chapterDelay = 0
 
@@ -216,19 +220,28 @@ class AnimeSama : ParsedHttpSource() {
         val title = url.queryParameter("title")
         val chapter = url.queryParameter("id")
 
-        val allChapters = document.body().toString().split("var")
+        val documentString = document.body().toString()
 
-        val chapterImageListString = allChapters.firstOrNull { it.contains("eps$chapter=") }
-            ?: return emptyList()
+        val allChapters: Map<Int, Int> = Regex("""eps(\d+)\s*(?:=\s*\[(.*?)\]|\.length\s*=\s*(\d+))""")
+            .findAll(documentString)
+            .associate { match ->
+                val episode = match.groupValues[1].toInt()
+                val arrayContent = match.groupValues[2]
+                val explicitLength = match.groupValues[3]
 
-        val chapterImageListParsed = chapterImageListString
-            .substringAfter("[")
-            .substringBefore("]")
-            .split(",")
+                val length = when {
+                    explicitLength.isNotEmpty() -> explicitLength.toInt()
+                    arrayContent.isNotEmpty() -> arrayContent.split(Regex(",\\s*")).count { it.isNotBlank() }
+                    else -> 0
+                }
+
+                episode to length
+            }
+
+        val chapterSize = allChapters.get(chapter?.toInt()) ?: 1
 
         val image_list = mutableListOf<Page>()
-
-        for (index in 1 until chapterImageListParsed.size) {
+        for (index in 1 until chapterSize + 1) {
             image_list.add(
                 Page(index, imageUrl = "$cdn$title/$chapter/$index.jpg"),
             )

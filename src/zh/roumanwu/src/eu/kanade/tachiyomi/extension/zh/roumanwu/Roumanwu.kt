@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.extension.zh.roumanwu
 
-import android.app.Application
 import android.content.SharedPreferences
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
@@ -13,18 +12,10 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import keiyoushi.utils.getPreferences
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
-import uy.kohesive.injekt.injectLazy
 import kotlin.math.max
 
 class Roumanwu : ParsedHttpSource(), ConfigurableSource {
@@ -32,18 +23,15 @@ class Roumanwu : ParsedHttpSource(), ConfigurableSource {
     override val lang = "zh"
     override val supportsLatest = true
 
-    private val preferences: SharedPreferences =
-        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
+    private val preferences: SharedPreferences = getPreferences()
 
     override val baseUrl = MIRRORS[
         max(MIRRORS.size - 1, preferences.getString(MIRROR_PREF, MIRROR_DEFAULT)!!.toInt()),
     ]
 
-    override val client = network.client.newBuilder().addInterceptor(ScrambledImageInterceptor).build()
+    override val client = network.cloudflareClient.newBuilder().addInterceptor(ScrambledImageInterceptor).build()
 
-    private val json: Json by injectLazy()
-
-    private val imageUrlRegex = """(?<=\[1,").*(?="\])""".toRegex()
+    private val imageUrlRegex = """\\"imageUrl\\":\\"([^\\]+)""".toRegex()
 
     override fun popularMangaRequest(page: Int) = GET("$baseUrl/home", headers)
     override fun popularMangaNextPageSelector(): String? = null
@@ -116,41 +104,16 @@ class Roumanwu : ParsedHttpSource(), ConfigurableSource {
     }
 
     override fun pageListParse(document: Document): List<Page> {
-        val jsonString = document.selectFirst("script:containsData(imageUrl)")?.data()
+        val images = document.selectFirst("script:containsData(imageUrl)")?.data()
             ?.let { content ->
                 imageUrlRegex
-                    .find(content)
-                    ?.value
-                    ?.substring(2)
-                    ?.dropLast(2)
-                    ?.replace("\\\"", "\"")
-            }
+                    .findAll(content).map { it.groups[1]?.value }
+                    .toList()
+            } ?: return emptyList()
 
-        return jsonString?.let { str ->
-            val jo = json.parseToJsonElement(str)
-            val pagesJson = jo.jsonArray
-                .getOrNull(3)?.jsonObject
-                ?.get("children")?.jsonArray
-                ?.getOrNull(6)?.jsonArray
-                ?.getOrNull(3)?.jsonObject
-                ?.get("children")?.jsonArray
-
-            pagesJson?.mapNotNull { pageElement ->
-                val pageData = pageElement.jsonArray
-                    .getOrNull(3)?.jsonObject
-                    ?.get("children")?.jsonArray
-                    ?.getOrNull(3)?.jsonObject
-
-                val index = pageData?.get("ind")?.jsonPrimitive?.intOrNull
-                val imageUrl = pageData?.get("imageUrl")?.jsonPrimitive?.contentOrNull
-
-                if (index != null && imageUrl != null) {
-                    Page(index, imageUrl = imageUrl)
-                } else {
-                    null
-                }
-            } ?: emptyList()
-        } ?: emptyList()
+        return images.mapIndexed { index, imageUrl ->
+            Page(index, imageUrl = imageUrl)
+        }
     }
 
     override fun imageUrlParse(document: Document) = throw UnsupportedOperationException()
@@ -202,7 +165,7 @@ class Roumanwu : ParsedHttpSource(), ConfigurableSource {
         private const val MIRROR_PREF_SUMMARY = "使用鏡像網址。重啟軟體生效。"
 
         // 地址: https://rou.pub/dizhi
-        private val MIRRORS get() = arrayOf("https://rouman5.com", "https://roum18.xyz")
+        private val MIRRORS get() = arrayOf("https://rouman5.com", "https://roum20.xyz")
         private val MIRRORS_DESC get() = arrayOf("主站", "鏡像")
         private const val MIRROR_DEFAULT = 1.toString() // use mirror
 

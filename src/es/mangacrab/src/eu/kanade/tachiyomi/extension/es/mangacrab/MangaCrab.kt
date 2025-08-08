@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.extension.es.mangacrab
 
-import android.app.Application
 import android.content.SharedPreferences
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
@@ -10,22 +9,21 @@ import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.multisrc.madara.Madara
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.ConfigurableSource
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
+import keiyoushi.utils.getPreferences
+import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
 import java.util.Locale
 
 class MangaCrab :
     Madara(
         "Manga Crab",
-        "https://wikicrab.xyz",
+        "https://mangacrab.topmanhuas.org",
         "es",
         SimpleDateFormat("dd/MM/yyyy", Locale("es")),
     ),
     ConfigurableSource {
 
-    private val preferences: SharedPreferences =
-        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
+    private val preferences: SharedPreferences = getPreferences()
 
     override val client = super.client.newBuilder()
         .setRandomUserAgent(
@@ -38,10 +36,26 @@ class MangaCrab :
     override val mangaSubString = "series"
     override val useLoadMoreRequest = LoadMoreStrategy.Never
 
+    override fun popularMangaSelector() = "div.manga__item"
+    override val popularMangaUrlSelector = "div.post-title a"
     override fun chapterListSelector() = "div.listing-chapters_wrap > ul > li"
+    override val mangaDetailsSelectorTitle = "h1.post-title"
     override val mangaDetailsSelectorDescription = "div.c-page__content div.modal-contenido"
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         addRandomUAPreferenceToScreen(screen)
+    }
+
+    override val pageListParseSelector = "div.page-break:not([style*='display:none'])"
+
+    override fun imageFromElement(element: Element): String? {
+        return when {
+            element.hasAttr("data-src") -> element.attr("abs:data-src")
+            element.hasAttr("data-lazy-src") -> element.attr("abs:data-lazy-src")
+            element.hasAttr("srcset") -> element.attr("abs:srcset").getSrcSetImage()
+            element.hasAttr("data-cfsrc") -> element.attr("abs:data-cfsrc")
+            element.hasAttr("data-src-base64") -> element.attr("abs:data-src-base64")
+            else -> element.attr("abs:src")
+        }
     }
 }
