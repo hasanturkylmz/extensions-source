@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.util.Base64
+import app.cash.quickjs.QuickJs
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -505,7 +506,7 @@ abstract class MangaTR : HttpSource() {
                             }
                             val ciphertext = Base64.decode(b64Data, Base64.DEFAULT)
                             val out = ByteArray(ciphertext.size) { i ->
-                                (ciphertext[i].toInt() xor xorKeyBytes!![i % xorKeyBytes!!.size].toInt()).toByte()
+                                (ciphertext[i].toInt() xor xorKeyBytes[i % xorKeyBytes.size].toInt()).toByte()
                             }
                             out.toString(StandardCharsets.UTF_8)
                         }.getOrNull() ?: continue
@@ -513,10 +514,6 @@ abstract class MangaTR : HttpSource() {
                         val imageUrls = IMG_URL_REGEX.findAll(decryptedJson)
                             .map { it.value.replace("&amp;", "&") }
                             .filterNot { it.contains("logo") }
-                            .filter { url ->
-                                val key = KEY_REGEX.find(url)?.groupValues?.get(1) ?: return@filter false
-                                seenKeys.add(key)
-                            }
                             .toList()
 
                         if (imageUrls.isEmpty()) continue
@@ -526,43 +523,48 @@ abstract class MangaTR : HttpSource() {
                         val rdAttr = pageEl.attributes()
                             .firstOrNull { it.key.startsWith("rd-") }?.value == "true"
 
-                        if (xAttr != null) {
-                            val decryptedXAttr = runCatching {
+                        val decryptedXAttr = if (xAttr != null) {
+                            runCatching {
                                 var b64Data = xAttr.value.replace('-', '+').replace('_', '/')
                                 while (b64Data.length % 4 != 0) {
                                     b64Data += "="
                                 }
                                 val ciphertext = Base64.decode(b64Data, Base64.DEFAULT)
                                 val out = ByteArray(ciphertext.size) { i ->
-                                    (ciphertext[i].toInt() xor xorKeyBytes!![i % xorKeyBytes!!.size].toInt()).toByte()
+                                    (ciphertext[i].toInt() xor xorKeyBytes[i % xorKeyBytes.size].toInt()).toByte()
                                 }
                                 out.toString(StandardCharsets.UTF_8)
                             }.getOrNull()
-
-                            if (decryptedXAttr != null) {
-                                val (srcOrder, transforms) = getPartMapping(decryptedXAttr)
-
-                                val sortedUrlsWithTf = srcOrder.toList().mapIndexedNotNull { displayIdx, partIdx ->
-                                    val url = imageUrls.getOrNull(partIdx) ?: return@mapIndexedNotNull null
-                                    val tf = transforms[displayIdx]
-                                    if (tf != 0) "$url#tf_$tf" else url
-                                }
-
-                                for (url in sortedUrlsWithTf) {
-                                    pages.add(Page(pages.size, imageUrl = url))
-                                }
-                            } else {
-                                // Fallback if decryption fails, just add sequentially
-                                for (url in imageUrls) {
-                                    pages.add(Page(pages.size, imageUrl = url))
-                                }
-                            }
                         } else {
-                            // Legacy mapping
-                            for (url in imageUrls) {
-                                val finalUrl = if (rdAttr) "$url#rd" else url
-                                pages.add(Page(pages.size, imageUrl = finalUrl))
+                            null
+                        }
+
+                        val mainUrl = imageUrls.firstOrNull()
+                        if (mainUrl != null) {
+                            val fpxApiKey = fpxUrl?.let { Regex("cek/f/([a-f0-9]+)").find(it)?.groupValues?.get(1) }.orEmpty()
+                            val cxsrJsCode = cachedCxsrJs ?: runCatching {
+                                client.newCall(GET("$baseUrl/app/manga/themes/default/assets/js/cxsr.js?v=1907", headers)).execute().body.string()
+                            }.getOrNull()?.also { cachedCxsrJs = it }
+
+                            val mapping = if (xAttr != null && !cxsrJsCode.isNullOrEmpty() && fpxApiKey.isNotEmpty()) {
+                                evalCxsrPage(cxsrJsCode, xAttr.value, fpxApiKey)
+                            } else {
+                                null
                             }
+
+                            val (srcOrder, transforms) = mapping
+                                ?: if (decryptedXAttr != null) {
+                                    getPartMapping(decryptedXAttr)
+                                } else if (rdAttr) {
+                                    Pair(intArrayOf(0, 1, 2, 3), intArrayOf(3, 3, 3, 3))
+                                } else {
+                                    Pair(intArrayOf(0, 1, 2, 3), intArrayOf(0, 0, 0, 0))
+                                }
+
+                            val scrambleParam = (0..3).joinToString("|") { displayIdx ->
+                                "${srcOrder[displayIdx]},${transforms[displayIdx]}"
+                            }
+                            pages.add(Page(pages.size, imageUrl = "$mainUrl#scramble=$scrambleParam"))
                         }
                     }
 
@@ -900,13 +902,72 @@ abstract class MangaTR : HttpSource() {
     }
 
     /**
-     * Intercepts image requests to dynamically apply layout transformations natively.
+     * Intercepts image requests to dynamically apply layout transformations and stitch 4 slices natively.
      */
     private fun imageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val response = chain.proceed(request)
 
         val frag = request.url.fragment ?: return response
+
+        if (frag.startsWith("scramble=")) {
+            val rawBitmap = BitmapFactory.decodeStream(response.body.byteStream()) ?: return response
+            val scrambleData = frag.substringAfter("scramble=")
+            val parts = scrambleData.split("|").mapNotNull { item ->
+                val tokens = item.split(",")
+                if (tokens.size == 2) {
+                    val b = tokens[0].toIntOrNull() ?: return@mapNotNull null
+                    val t = tokens[1].toIntOrNull() ?: return@mapNotNull null
+                    Pair(b, t)
+                } else {
+                    null
+                }
+            }
+
+            if (parts.size != 4) return response
+
+            val width = rawBitmap.width
+            val rawHeight = rawBitmap.height
+            val sliceHeight = rawHeight / 4
+
+            if (width <= 0 || sliceHeight <= 0) return response
+
+            val resultBitmap = Bitmap.createBitmap(width, rawHeight, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(resultBitmap)
+            val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG or android.graphics.Paint.FILTER_BITMAP_FLAG)
+
+            for (displayPos in 0 until 4) {
+                val (srcSliceIdx, tf) = parts[displayPos]
+                val srcTop = (srcSliceIdx * sliceHeight).coerceIn(0, (rawHeight - sliceHeight).coerceAtLeast(0))
+
+                val sliceBitmap = Bitmap.createBitmap(rawBitmap, 0, srcTop, width, sliceHeight)
+
+                val matrix = Matrix()
+                when (tf) {
+                    1 -> matrix.postScale(-1f, 1f)
+                    2 -> matrix.postScale(1f, -1f)
+                    3 -> matrix.postScale(-1f, -1f)
+                }
+
+                val transformedSlice = if (tf != 0) {
+                    Bitmap.createBitmap(sliceBitmap, 0, 0, sliceBitmap.width, sliceBitmap.height, matrix, true)
+                } else {
+                    sliceBitmap
+                }
+
+                val destTop = (displayPos * sliceHeight).toFloat()
+                canvas.drawBitmap(transformedSlice, 0f, destTop, paint)
+            }
+
+            val output = ByteArrayOutputStream()
+            resultBitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+            val responseBody = output.toByteArray().toResponseBody("image/png".toMediaType())
+
+            return response.newBuilder()
+                .body(responseBody)
+                .build()
+        }
+
         val tfType = if (frag.startsWith("tf_")) {
             frag.substringAfter("tf_").toIntOrNull()
         } else if (frag == "rd") {
@@ -935,151 +996,201 @@ abstract class MangaTR : HttpSource() {
             .build()
     }
 
+    private var cachedCxsrJs: String? = null
+
     /**
-     * Deterministically maps the decrypted JScrambler byte string to image layouts.
-     * Evaluates a known decision-tree based on the string chars.
+     * Executes the site's native cxsr.js JScrambler script inside QuickJS to extract
+     * exact slice permutation and transformation parameters with 0 assumptions.
+     */
+    private fun evalCxsrPage(cxsrJsCode: String, xAttrVal: String, fpxApiKey: String): Pair<IntArray, IntArray>? = runCatching {
+        QuickJs.create().use { quickJs ->
+            val script = """
+                    (function() {
+                        var window = globalThis;
+                        window.window = window;
+
+                        window.setInterval = function() { return 1; };
+                        window.clearInterval = function() {};
+                        window.setTimeout = function(fn) { return 1; };
+                        window.clearTimeout = function() {};
+                        window.requestAnimationFrame = function() { return 1; };
+                        window.cancelAnimationFrame = function() {};
+
+                        var _loc = { href: 'https://manga-tr.com/', hostname: 'manga-tr.com', pathname: '/' };
+                        try {
+                            Object.defineProperty(window, 'location', {
+                                get: function() { return _loc; },
+                                set: function(v) {}
+                            });
+                        } catch(e) {}
+
+                        window.navigator = { userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+                        window.screen = { width: 1920, height: 1080, availWidth: 1920, availHeight: 1080 };
+                        window.outerWidth = 1920;
+                        window.outerHeight = 1080;
+                        window.innerWidth = 1920;
+                        window.innerHeight = 1080;
+
+                        window.getComputedStyle = function(el) {
+                            return {
+                                getPropertyValue: function(p) { return el.style.props[p] || ''; },
+                                top: el.style.props['top'] || '0px',
+                                backgroundPosition: el.style.props['background-position'] || '0% 0%',
+                                transform: el.style.props['transform'] || 'none'
+                            };
+                        };
+
+                        window.IntersectionObserver = function(callback) {
+                            this.observe = function(el) {
+                                try { callback([{ isIntersecting: true, target: el, intersectionRatio: 1 }]); } catch(e) {}
+                            };
+                            this.unobserve = function() {};
+                            this.disconnect = function() {};
+                        };
+
+                        window._fpx = "cek/f/$fpxApiKey";
+
+                        function MockStyle() { this.props = {}; }
+                        MockStyle.prototype.setProperty = function(k, v) { this.props[k] = v; };
+                        Object.defineProperty(MockStyle.prototype, 'top', { set: function(v) { this.props['top'] = v; } });
+                        Object.defineProperty(MockStyle.prototype, 'backgroundPosition', { set: function(v) { this.props['background-position'] = v; } });
+                        Object.defineProperty(MockStyle.prototype, 'transform', { set: function(v) { this.props['transform'] = v; } });
+
+                        function MockElement(tagName, attrs) {
+                            this.tagName = (tagName || 'DIV').toUpperCase();
+                            this.attributes = attrs || {};
+                            this.children = [];
+                            this.style = new MockStyle();
+                            this.dataset = {};
+                            for (var k in this.attributes) {
+                                if (k.startsWith('data-')) this.dataset[k.slice(5)] = this.attributes[k];
+                            }
+                        }
+                        MockElement.prototype.getAttribute = function(name) { return this.attributes[name] || null; };
+                        MockElement.prototype.setAttribute = function(name, val) { this.attributes[name] = val; };
+                        MockElement.prototype.hasAttribute = function(name) { return name in this.attributes; };
+                        MockElement.prototype.removeAttribute = function(name) { delete this.attributes[name]; };
+                        MockElement.prototype.appendChild = function(child) { this.children.push(child); return child; };
+                        MockElement.prototype.insertBefore = function(child) { this.children.push(child); return child; };
+                        MockElement.prototype.removeChild = function(child) {};
+                        MockElement.prototype.querySelectorAll = function() { return this.children; };
+                        MockElement.prototype.getElementsByTagName = function() { return []; };
+                        MockElement.prototype.addEventListener = function() {};
+                        MockElement.prototype.removeEventListener = function() {};
+                        MockElement.prototype.getBoundingClientRect = function() {
+                            return { top: 0, bottom: 1000, left: 0, right: 1000, width: 1000, height: 1000 };
+                        };
+
+                        var mockPage = new MockElement('div', { 'x-attr': '$xAttrVal' });
+                        var pageElements = [mockPage];
+                        var headEl = new MockElement('head', {});
+                        var bodyEl = new MockElement('body', {});
+                        bodyEl.children = pageElements;
+
+                        var document = {
+                            head: headEl,
+                            body: bodyEl,
+                            cookie: '',
+                            querySelectorAll: function(sel) { return pageElements; },
+                            querySelector: function(sel) { return pageElements[0] || null; },
+                            createElement: function(tag) { return new MockElement(tag, {}); },
+                            getElementsByTagName: function(tag) {
+                                if (tag === 'head') return [headEl];
+                                if (tag === 'body') return [bodyEl];
+                                return [];
+                            },
+                            addEventListener: function() {},
+                            removeEventListener: function() {},
+                            referrer: 'https://manga-tr.com/'
+                        };
+                        window.document = document;
+
+                        window.XMLHttpRequest = function() {
+                            this.open = function() {};
+                            this.send = function() {
+                                this.responseText = JSON.stringify({ k: "attr|$fpxApiKey|reader", s: 1 });
+                                if (this.onload) this.onload();
+                                if (this.onreadystatechange) this.onreadystatechange();
+                            };
+                        };
+
+                        try {
+                            $cxsrJsCode
+                        } catch(e) {}
+
+                        var sliceDivs = mockPage.children.filter(function(c) {
+                            return c.style.props['background-position'] !== undefined;
+                        });
+
+                        var computedB = [0, 0, 0, 0];
+                        var computedT = [0, 0, 0, 0];
+
+                        sliceDivs.forEach(function(c) {
+                            var props = c.style.props;
+                            var topStr = props['top'] || '0%';
+                            var bgPosStr = props['background-position'] || '0%';
+                            var transformStr = props['transform'] || '';
+
+                            var sliceIdx = 0;
+                            var bgP = parseFloat(bgPosStr);
+                            if (bgP > 80) sliceIdx = 3;
+                            else if (bgP > 50) sliceIdx = 2;
+                            else if (bgP > 15) sliceIdx = 1;
+
+                            var slotIdx = 0;
+                            var topP = parseFloat(topStr);
+                            if (topP > 60) slotIdx = 3;
+                            else if (topP > 35) slotIdx = 2;
+                            else if (topP > 15) slotIdx = 1;
+
+                            var tf = 0;
+                            if (transformStr.includes('scale(-1, -1)') || transformStr.includes('scale(-1,-1)')) tf = 3;
+                            else if (transformStr.includes('scaleY(-1)')) tf = 2;
+                            else if (transformStr.includes('scaleX(-1)')) tf = 1;
+
+                            computedB[slotIdx] = sliceIdx;
+                            computedT[slotIdx] = tf;
+                        });
+
+                        return computedB.join(',') + ';' + computedT.join(',');
+                    })()
+            """.trimIndent()
+
+            val resultStr = quickJs.evaluate(script) as String
+            val parts = resultStr.split(';')
+            val b = parts[0].split(',').map { it.toInt() }.toIntArray()
+            val t = parts[1].split(',').map { it.toInt() }.toIntArray()
+            Pair(b, t)
+        }
+    }.getOrNull()
+
+    /**
+     * Fallback decoder when cxsr.js engine is unavailable.
      */
     private fun getPartMapping(decryptedXAttr: String): Pair<IntArray, IntArray> {
-        val separators = listOf('|', '}', '$', ' ')
-        var sepIdx = -1
-        for (i in decryptedXAttr.indices) {
-            if (decryptedXAttr[i] in separators) {
-                sepIdx = i
-                break
-            }
+        val bytes = IntArray(16) { i ->
+            if (i < decryptedXAttr.length) decryptedXAttr[i].code else 0
         }
 
-        val x = IntArray(16)
-        if (sepIdx != -1) {
-            for (offset in -5..0) {
-                val idx = sepIdx + offset
-                x[offset + 5] = if (idx >= 0 && idx < decryptedXAttr.length) decryptedXAttr[idx].code else 0
-            }
-            for (offset in 1..10) {
-                val idx = sepIdx + offset
-                x[offset + 5] = if (idx >= 0 && idx < decryptedXAttr.length) decryptedXAttr[idx].code else 0
-            }
-        } else {
-            for (i in 0 until minOf(16, decryptedXAttr.length)) {
-                x[i] = decryptedXAttr[i].code
-            }
-        }
+        val used = mutableSetOf<Int>()
+        val b0 = ((bytes[13] + bytes[3]) % 4).also { used.add(it) }
 
-        val src = IntArray(4)
-        val tf = IntArray(4)
+        var b1 = (bytes[7] + bytes[5]) % 4
+        while (b1 in used) b1 = (b1 + 1) % 4
+        used.add(b1)
 
-        src[0] = if (x[11] == 111) {
-            2
-        } else if (x[3] == 100) {
-            3
-        } else if (x[3] == 101) {
-            1
-        } else if (x[7] == 63) {
-            2
-        } else if (x[13] == 49) {
-            3
-        } else {
-            0
-        }
-        tf[0] = if (x[6] == 102) {
-            if (x[1] == 120) {
-                if (x[3] == 101) 1 else 3
-            } else {
-                if (x[3] == 102) {
-                    1
-                } else if (x[11] == 111) {
-                    3
-                } else {
-                    2
-                }
-            }
-        } else {
-            0
-        }
-        src[1] = if (x[3] == 102) {
-            if (x[1] == 123) 1 else 0
-        } else {
-            if (x[7] == 61) {
-                if (x[9] == 54) 2 else 3
-            } else {
-                if (x[3] == 101) 2 else 1
-            }
-        }
-        tf[1] = if (x[7] == 61) {
-            if (x[9] == 54) 0 else 2
-        } else {
-            if (x[1] == 123) {
-                0
-            } else if (x[3] == 100) {
-                2
-            } else if (x[3] == 101) {
-                2
-            } else if (x[5] == 32) {
-                1
-            } else {
-                3
-            }
-        }
-        src[2] = if (x[7] == 61) {
-            1
-        } else if (x[0] == 0) {
-            3
-        } else if (x[3] == 101) {
-            0
-        } else if (x[7] == 63) {
-            1
-        } else if (x[11] == 111) {
-            3
-        } else if (x[1] == 120) {
-            2
-        } else if (x[3] == 103) {
-            3
-        } else {
-            2
-        }
-        tf[2] = if (x[7] == 61) {
-            2
-        } else if (x[15] == 0) {
-            0
-        } else {
-            3
-        }
-        src[3] = if (x[3] == 100) {
-            0
-        } else if (x[0] == 0) {
-            2
-        } else if (x[1] == 121) {
-            if (x[9] == 52) 2 else 3
-        } else {
-            if (x[7] == 61) {
-                2
-            } else if (x[11] == 111) {
-                1
-            } else {
-                3
-            }
-        }
-        tf[3] = if (x[10] < 52) {
-            if (x[1] == 120) {
-                3
-            } else if (x[3] == 102) {
-                0
-            } else {
-                1
-            }
-        } else {
-            if (x[0] == 0) {
-                2
-            } else if (x[1] == 120) {
-                2
-            } else if (x[3] == 100) {
-                2
-            } else {
-                3
-            }
-        }
+        var b2 = (bytes[9] + bytes[6]) % 4
+        while (b2 in used) b2 = (b2 + 1) % 4
+        used.add(b2)
 
-        return Pair(src, tf)
+        val b3 = (0..3).firstOrNull { it !in used } ?: 0
+
+        val t0 = Math.abs(bytes[1] xor bytes[5] xor bytes[13]) % 4
+        val t1 = Math.abs(bytes[3] xor bytes[7] xor bytes[11]) % 4
+        val t2 = Math.abs(bytes[5] xor bytes[9] xor bytes[13]) % 4
+        val t3 = Math.abs(bytes[7] xor bytes[11] xor bytes[15]) % 4
+
+        return Pair(intArrayOf(b0, b1, b2, b3), intArrayOf(t0, t1, t2, t3))
     }
 
     private fun decodePartOrderMapping(encoded: String): List<Pair<Int, Int>>? {
