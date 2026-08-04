@@ -4,7 +4,7 @@ plugins {
 
 keiyoushi {
     name = "Manga-TR"
-    versionCode = 64
+    versionCode = 65
     contentWarning = ContentWarning.NSFW
     libVersion = "1.4"
 

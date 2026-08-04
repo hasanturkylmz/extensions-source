@@ -539,6 +539,8 @@ abstract class MangaTR : HttpSource() {
                             null
                         }
 
+                        val pageAttrsMap = pageEl.attributes().associate { it.key to it.value }
+
                         val mainUrl = imageUrls.firstOrNull()
                         if (mainUrl != null) {
                             val fpxApiKey = fpxUrl?.let { Regex("cek/f/([a-f0-9]+)").find(it)?.groupValues?.get(1) }.orEmpty()
@@ -547,7 +549,7 @@ abstract class MangaTR : HttpSource() {
                             }.getOrNull()?.also { cachedCxsrJs = it }
 
                             val mapping = if (xAttr != null && !cxsrJsCode.isNullOrEmpty() && fpxApiKey.isNotEmpty()) {
-                                evalCxsrPage(cxsrJsCode, xAttr.value, fpxApiKey)
+                                evalCxsrPage(cxsrJsCode, pageAttrsMap, fpxApiKey)
                             } else {
                                 null
                             }
@@ -1002,7 +1004,11 @@ abstract class MangaTR : HttpSource() {
      * Executes the site's native cxsr.js JScrambler script inside QuickJS to extract
      * exact slice permutation and transformation parameters with 0 assumptions.
      */
-    private fun evalCxsrPage(cxsrJsCode: String, xAttrVal: String, fpxApiKey: String): Pair<IntArray, IntArray>? = runCatching {
+    private fun evalCxsrPage(cxsrJsCode: String, pageAttrsMap: Map<String, String>, fpxApiKey: String): Pair<IntArray, IntArray>? = runCatching {
+        val attrsJson = pageAttrsMap.entries.joinToString(prefix = "{", postfix = "}") { (k, v) ->
+            "\"$k\":\"$v\""
+        }
+
         QuickJs.create().use { quickJs ->
             val script = """
                     (function() {
@@ -1081,7 +1087,8 @@ abstract class MangaTR : HttpSource() {
                             return { top: 0, bottom: 1000, left: 0, right: 1000, width: 1000, height: 1000 };
                         };
 
-                        var mockPage = new MockElement('div', { 'x-attr': '$xAttrVal' });
+                        var pageAttrs = $attrsJson;
+                        var mockPage = new MockElement('div', pageAttrs);
                         var pageElements = [mockPage];
                         var headEl = new MockElement('head', {});
                         var bodyEl = new MockElement('body', {});
